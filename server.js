@@ -45,18 +45,43 @@ function parseCsv(text) {
   return rows;
 }
 
+// מידע לאבחון (מוצג בכתובת /debug)
+let info = { loaded: false, count: 0, sample: [], source: '', warnings: [], preview: '', at: null };
+
+// מחלץ ברקודים מכל התאים בקובץ (לא משנה באיזו עמודה הם)
+function extractBarcodes(rows) {
+  const map = new Map();
+  const warnings = [];
+  for (const row of rows) {
+    let code = null;
+    let name = '';
+    for (const raw of row) {
+      const cell = String(raw || '').trim();
+      if (!cell) continue;
+      if (!code && /^[\d\s]{8,14}$/.test(cell)) {
+        code = normalize(cell);
+      } else if (/^\d(\.\d+)?E\+?\d+$/i.test(cell)) {
+        // גוגל הציג מספר ארוך בכתיבה מדעית - חלק מהספרות אבדו
+        warnings.push(`התא "${cell}" מוצג בכתיבה מדעית. יש לעצב את העמודה כטקסט רגיל`);
+      } else if (!name && !/^[\d\s]+$/.test(cell)) {
+        name = cell; // שם המוצר: התא הראשון בשורה שאינו מספר
+      }
+    }
+    if (code) map.set(code, name);
+  }
+  return { map, warnings };
+}
+
 async function loadSheet() {
   if (Date.now() - lastLoad < REFRESH_MS && products.size) return;
   for (const url of SHEET_URLS) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const rows = parseCsv(await res.text());
-      const map = new Map();
-      for (const [barcode, name] of rows) {
-        const key = normalize(barcode);
-        if (key.length >= 6) map.set(key, (name || '').trim());
-      }
+      const text = await res.text();
+      if (/^\s*</.test(text)) throw new Error('התקבל דף אינטרנט במקום קובץ (בדוק שהקובץ משותף לכל מי שיש לו את הקישור)');
+      const { map, warnings } = extractBarcodes(parseCsv(text));
+      info = { loaded: map.size > 0, count: map.size, sample: [...map.keys()].slice(0, 30), source: url, warnings, preview: text.slice(0, 300), at: new Date().toISOString() };
       if (map.size === 0) throw new Error('לא נמצאו ברקודים בקובץ');
       products = map;
       lastLoad = Date.now();
@@ -64,6 +89,7 @@ async function loadSheet() {
       return;
     } catch (e) {
       console.error('שגיאה בטעינת הקובץ:', e.message);
+      info.warnings = [...(info.warnings || []), e.message];
     }
   }
   // אם לא הצלחנו לטעון כלל, לא ממשיכים עם רשימה ריקה
@@ -111,7 +137,7 @@ router.get('/', async (call) => {
   await loadSheet();
   const key = normalize(barcode);
   const recommended = products.has(key);
-  const name = await lookupNameOnline(key); // שם המוצר תמיד מהמאגר החיצוני
+  const name = products.get(key) || await lookupNameOnline(key); // קודם שם מהקובץ (עמודה B), ואם אין - מהמאגר החיצוני
 
   // 4. שם המוצר (אם נמצא) ואחריו ההמלצה. אם לא נמצא שם - עוברים ישר להמלצה
   const messages = [];
@@ -123,5 +149,12 @@ router.get('/', async (call) => {
 
 const app = express();
 app.get('/health', (req, res) => res.send('ok')); // לבדיקת חיים (UptimeRobot)
+// אבחון: מציג מה השרת קרא מהקובץ. אפשר גם /debug?code=7290016897111
+app.get('/debug', async (req, res) => {
+  try { await loadSheet(); } catch (e) { info.warnings = [...(info.warnings || []), e.message]; }
+  const out = { ...info };
+  if (req.query.code) out.check = { code: req.query.code, found: products.has(normalize(req.query.code)) };
+  res.set('Content-Type', 'application/json; charset=utf-8').send(JSON.stringify(out, null, 2));
+});
 app.use('/', router);
 app.listen(process.env.PORT || 3000, () => console.log('השרת פועל'));
